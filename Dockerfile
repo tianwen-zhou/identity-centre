@@ -1,4 +1,4 @@
-FROM quay.io/keycloak/keycloak:latest AS builder
+FROM identity-centre-base:latest AS builder
 
 ENV KC_DB=postgres \
     KC_HEALTH_ENABLED=true \
@@ -11,7 +11,11 @@ RUN /opt/keycloak/bin/kc.sh build
 
 
 # 运行阶段：使用构建结果启动 Keycloak
-FROM quay.io/keycloak/keycloak:latest
+FROM identity-centre-base:latest
+
+USER root
+
+RUN dnf install -y openssl iputils curl procps-ng
 
 
 # 拷贝构建结果

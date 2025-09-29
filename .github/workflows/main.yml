@@ -52,7 +52,18 @@ jobs:
       # 8. 触发 ECS Service 更新
       - name: Update ECS service
         run: |
+          set -euo pipefail
           aws ecs update-service \
+            --region ap-southeast-2 \
             --cluster IDENTITY-CENTRE-NONPROD \
             --service IDENTITY-CENTRE-NONPROD-SERVICE \
             --force-new-deployment
+
+          # 调试：查看最近事件
+          aws ecs describe-services \
+            --region ap-southeast-2 \
+            --cluster IDENTITY-CENTRE-NONPROD \
+            --services IDENTITY-CENTRE-NONPROD-SERVICE \
+            --query 'services[0].events[0:10]'
+
+            

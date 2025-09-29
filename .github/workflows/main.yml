@@ -55,7 +55,7 @@ jobs:
         id: meta
         run: |
           set -euo pipefail
-          echo "TAG=$(date -u +'%Y%m%d-%H%M')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "TAG=$(date -u +'%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
 
       - name: Tag and push to ECR
         env:

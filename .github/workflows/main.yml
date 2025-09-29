@@ -11,7 +11,7 @@ env:
   ECR_REPOSITORY: "appzgatenz/topsale/identity-centre"
   CLUSTER: "IDENTITY-CENTRE-NONPROD"
   SERVICE: "IDENTITY-CENTRE-NONPROD-SERVICE"
-  # 需为“任务定义里容器的 name”。若留空且仅 1 个容器，将自动检测。
+  # 容器的 name（来自任务定义的 containerDefinitions[].name）。若留空且只有 1 个容器，会自动选择。
   CONTAINER_NAME: "IDENTITY-CENTRE-NONPROD-TD"
 
 concurrency:
@@ -29,7 +29,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 暂用 AK/SK；后续建议改为 OIDC 角色
+      # 暂用 AK/SK；后续建议切换到 OIDC 角色更安全
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -117,7 +117,7 @@ jobs:
             --task-definition "${TD_ARN}" \
             --output json)
 
-          # 仅保留允许的顶级字段，并递归删除所有 null
+          # 仅保留允许的字段，并递归删除所有 null，避免 CLI 校验失败
           BASE=$(echo "${TD_ALL}" | jq '
             .taskDefinition
             | {
@@ -129,7 +129,7 @@ jobs:
             | del(.. | nulls)
           ')
 
-          # 处理容器名：若未设置且仅 1 个容器，自动选择；若设置但不存在且仅 1 个容器，也自动选择；多个容器则校验
+          # 处理容器名：若未设置且仅 1 个容器，自动选择；若多个容器需显式设置正确的 name
           CNT=$(echo "${BASE}" | jq '.containerDefinitions | length')
           TARGET="${CONTAINER_NAME}"
           if [ -z "${TARGET}" ]; then
@@ -156,14 +156,14 @@ jobs:
             fi
           fi
 
-          NEW_IMAGE="${REPO_URI}@${DIGEST}"  # 不可变部署
+          NEW_IMAGE="${REPO_URI}@${DIGEST}"  # 使用不可变 digest
           NEW_TD=$(echo "${BASE}" | jq --arg name "${TARGET}" --arg img "${NEW_IMAGE}" '
             .containerDefinitions |= (map(
               if .name == $name then .image = $img else . end
             ))
           ')
 
-          # 健全性检查：确认替换生效
+          # 校验替换是否生效
           echo "${NEW_TD}" | jq -e --arg name "${TARGET}" --arg img "${NEW_IMAGE}" \
             'any(.containerDefinitions[]; .name==$name and .image==$img)' >/dev/null \
             || { echo "Image replacement failed"; exit 1; }
@@ -198,12 +198,12 @@ jobs:
       - name: Update service to new task definition
         run: |
           set -euo pipefail
+          # 不再传 --deployment-configuration，避免与 AZ Rebalancing 冲突
           aws ecs update-service \
             --region "${AWS_REGION}" \
             --cluster "${CLUSTER}" \
             --service "${SERVICE}" \
-            --task-definition "${{ steps.register.outputs.NEW_TD_ARN }}" \
-            --deployment-configuration minimumHealthyPercent=0,maximumPercent=100
+            --task-definition "${{ steps.register.outputs.NEW_TD_ARN }}"
           echo "Service updated to new TD."
 
       - name: Scale service to 1 and wait

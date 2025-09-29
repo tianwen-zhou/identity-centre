@@ -29,8 +29,8 @@ jobs:
           | docker login --username AWS --password-stdin 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com
 
       # 4. 构建 Docker 镜像
-      - name: Build Docker image
-        run: docker build -t keycloak:latest .
+      - name: Build base image
+        run: docker build -t identity-centre-base:latest -f Dockerfile.base .
 
       # 5. 推送到 ECR
       - name: Push Docker image to ECR

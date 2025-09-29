@@ -11,7 +11,7 @@ env:
   ECR_REPOSITORY: "appzgatenz/topsale/identity-centre"
   CLUSTER: "IDENTITY-CENTRE-NONPROD"
   SERVICE: "IDENTITY-CENTRE-NONPROD-SERVICE"
-  # TODO: 修改为你任务定义里的容器 name；若不确定，脚本会在仅有一个容器时自动选择
+  # 需为“任务定义里容器的 name”。若留空且仅 1 个容器，将自动检测。
   CONTAINER_NAME: "IDENTITY-CENTRE-NONPROD-TD"
 
 concurrency:
@@ -29,7 +29,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 你目前使用 AK/SK，保留如下配置；以后可改用 OIDC 角色（更安全）
+      # 暂用 AK/SK；后续建议改为 OIDC 角色
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -42,14 +42,19 @@ jobs:
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build base image
-        run: docker build -t identity-centre-base:latest -f Dockerfile_base .
+        run: |
+          set -euo pipefail
+          docker build -t identity-centre-base:latest -f Dockerfile_base .
 
       - name: Build app image (keycloak)
-        run: docker build -t keycloak:latest -f Dockerfile .
+        run: |
+          set -euo pipefail
+          docker build -t keycloak:latest -f Dockerfile .
 
       - name: Set TAG
         id: meta
         run: |
+          set -euo pipefail
           echo "TAG=$(date -u +'%Y%m%d-%H%M')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
       - name: Tag and push to ECR
@@ -83,9 +88,12 @@ jobs:
           echo "Resolved digest: ${DIGEST}"
 
       - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
 
-      - name: Register new task definition revision (replace image)
+      - name: Register new task definition revision (strip nulls, replace image)
         id: register
         env:
           CLUSTER: ${{ env.CLUSTER }}
@@ -95,6 +103,7 @@ jobs:
           DIGEST: ${{ steps.digest.outputs.DIGEST }}
         run: |
           set -euo pipefail
+
           TD_ARN=$(aws ecs describe-services \
             --region "${AWS_REGION}" \
             --cluster "${CLUSTER}" \
@@ -103,52 +112,70 @@ jobs:
             --output text)
           echo "Current TD: ${TD_ARN}"
 
-          TD_JSON=$(aws ecs describe-task-definition \
+          TD_ALL=$(aws ecs describe-task-definition \
             --region "${AWS_REGION}" \
             --task-definition "${TD_ARN}" \
-            --query 'taskDefinition |
-              {
-                family: family,
-                taskRoleArn: taskRoleArn,
-                executionRoleArn: executionRoleArn,
-                networkMode: networkMode,
-                containerDefinitions: containerDefinitions,
-                volumes: volumes,
-                placementConstraints: placementConstraints,
-                requiresCompatibilities: requiresCompatibilities,
-                cpu: cpu,
-                memory: memory,
-                pidMode: pidMode,
-                ipcMode: ipcMode,
-                proxyConfiguration: proxyConfiguration,
-                inferenceAccelerators: inferenceAccelerators,
-                ephemeralStorage: ephemeralStorage
-              }' \
             --output json)
 
-          # 若 CONTAINER_NAME 未命中且只有 1 个容器，自动选择该容器
-          CONTAINER_COUNT=$(echo "${TD_JSON}" | jq '.containerDefinitions | length')
-          TARGET_CONTAINER="${CONTAINER_NAME}"
-          if [ "${CONTAINER_NAME}" = "" ] || [ "${CONTAINER_NAME}" = "keycloak" ]; then
-            if [ "${CONTAINER_COUNT}" -eq 1 ]; then
-              TARGET_CONTAINER=$(echo "${TD_JSON}" | jq -r '.containerDefinitions[0].name')
-              echo "Auto-detected single container: ${TARGET_CONTAINER}"
+          # 仅保留允许的顶级字段，并递归删除所有 null
+          BASE=$(echo "${TD_ALL}" | jq '
+            .taskDefinition
+            | {
+                family, taskRoleArn, executionRoleArn, networkMode,
+                containerDefinitions, volumes, placementConstraints,
+                requiresCompatibilities, cpu, memory, runtimePlatform,
+                pidMode, ipcMode, proxyConfiguration, inferenceAccelerators, ephemeralStorage
+              }
+            | del(.. | nulls)
+          ')
+
+          # 处理容器名：若未设置且仅 1 个容器，自动选择；若设置但不存在且仅 1 个容器，也自动选择；多个容器则校验
+          CNT=$(echo "${BASE}" | jq '.containerDefinitions | length')
+          TARGET="${CONTAINER_NAME}"
+          if [ -z "${TARGET}" ]; then
+            if [ "${CNT}" -eq 1 ]; then
+              TARGET=$(echo "${BASE}" | jq -r '.containerDefinitions[0].name')
+              echo "Auto-detected container: ${TARGET}"
+            else
+              echo "ERROR: Multiple containers found; please set CONTAINER_NAME to one of:"
+              echo "${BASE}" | jq -r '.containerDefinitions[].name'
+              exit 1
+            fi
+          else
+            if echo "${BASE}" | jq -e --arg n "${TARGET}" 'any(.containerDefinitions[].name; . == $n)' >/dev/null; then
+              echo "Using container: ${TARGET}"
+            else
+              if [ "${CNT}" -eq 1 ]; then
+                TARGET=$(echo "${BASE}" | jq -r '.containerDefinitions[0].name')
+                echo "WARN: CONTAINER_NAME not found; auto-selected single container: ${TARGET}"
+              else
+                echo "ERROR: CONTAINER_NAME \"${TARGET}\" not found. Available containers:"
+                echo "${BASE}" | jq -r '.containerDefinitions[].name'
+                exit 1
+              fi
             fi
           fi
 
-          NEW_IMAGE="${REPO_URI}@${DIGEST}"  # 使用不可变 digest
-          NEW_TD_JSON=$(echo "${TD_JSON}" | jq --arg name "${TARGET_CONTAINER}" --arg img "${NEW_IMAGE}" '
-            .containerDefinitions = (.containerDefinitions | map(
+          NEW_IMAGE="${REPO_URI}@${DIGEST}"  # 不可变部署
+          NEW_TD=$(echo "${BASE}" | jq --arg name "${TARGET}" --arg img "${NEW_IMAGE}" '
+            .containerDefinitions |= (map(
               if .name == $name then .image = $img else . end
-            ))')
+            ))
+          ')
 
-          REGISTER_OUT=$(aws ecs register-task-definition \
+          # 健全性检查：确认替换生效
+          echo "${NEW_TD}" | jq -e --arg name "${TARGET}" --arg img "${NEW_IMAGE}" \
+            'any(.containerDefinitions[]; .name==$name and .image==$img)' >/dev/null \
+            || { echo "Image replacement failed"; exit 1; }
+
+          OUT=$(aws ecs register-task-definition \
             --region "${AWS_REGION}" \
-            --cli-input-json "${NEW_TD_JSON}")
-          NEW_TD_ARN=$(echo "${REGISTER_OUT}" | jq -r '.taskDefinition.taskDefinitionArn')
+            --cli-input-json "${NEW_TD}")
+          NEW_TD_ARN=$(echo "${OUT}" | jq -r '.taskDefinition.taskDefinitionArn')
+
           if [ -z "${NEW_TD_ARN}" ] || [ "${NEW_TD_ARN}" = "null" ]; then
             echo "Failed to register new task definition"
-            echo "${REGISTER_OUT}"
+            echo "${OUT}"
             exit 1
           fi
           echo "NEW_TD_ARN=${NEW_TD_ARN}" >> "$GITHUB_OUTPUT"
@@ -179,7 +206,7 @@ jobs:
             --deployment-configuration minimumHealthyPercent=0,maximumPercent=100
           echo "Service updated to new TD."
 
-      - name: Scale service to 1
+      - name: Scale service to 1 and wait
         run: |
           set -euo pipefail
           aws ecs update-service \
@@ -193,9 +220,10 @@ jobs:
             --services "${SERVICE}"
           echo "Service scaled to 1 and stabilized."
 
-      - name: Show last 10 service events
+      - name: Show last 10 service events (debug)
         if: always()
         run: |
+          set -euo pipefail
           aws ecs describe-services \
             --region "${AWS_REGION}" \
             --cluster "${CLUSTER}" \

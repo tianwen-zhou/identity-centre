@@ -30,7 +30,7 @@ jobs:
 
       # 4. 构建 Docker 镜像
       - name: Build base image
-        run: docker build -t identity-centre-base:latest -f Dockerfile.base .
+        run: docker build -t identity-centre-base:latest -f Dockerfile_base .
 
       # 5. 推送到 ECR
       - name: Push Docker image to ECR

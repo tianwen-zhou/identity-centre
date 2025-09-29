@@ -1,69 +1,203 @@
-name: Deploy Keycloak to ECS
+name: Deploy Keycloak to ECS (downtime replace)
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+  ACCOUNT_ID: "533267398655"
+  ECR_REPOSITORY: "appzgatenz/topsale/identity-centre"
+  CLUSTER: "IDENTITY-CENTRE-NONPROD"
+  SERVICE: "IDENTITY-CENTRE-NONPROD-SERVICE"
+  # TODO: 修改为你任务定义里的容器 name；若不确定，脚本会在仅有一个容器时自动选择
+  CONTAINER_NAME: "IDENTITY-CENTRE-NONPROD-TD"
+
+concurrency:
+  group: ecs-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
-      # 1. 拉取代码
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
-      # 2. 配置 AWS 凭证
+      # 你目前使用 AK/SK，保留如下配置；以后可改用 OIDC 角色（更安全）
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ap-southeast-2
+          aws-region: ${{ env.AWS_REGION }}
 
-      # 3. 登录 ECR
       - name: Login to Amazon ECR
-        run: |
-          aws ecr get-login-password --region ap-southeast-2 \
-          | docker login --username AWS --password-stdin 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-      # 4. 构建 base 镜像
       - name: Build base image
         run: docker build -t identity-centre-base:latest -f Dockerfile_base .
 
-      # 5. 构建 keycloak 镜像
-      - name: Build keycloak image
+      - name: Build app image (keycloak)
         run: docker build -t keycloak:latest -f Dockerfile .
 
-      # 6. 设置时间戳
-      - name: Set build timestamp
-        id: vars
-        run: echo "TAG=$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
-
-      # 7. 推送到 ECR
-      - name: Push Docker image to ECR
+      - name: Set TAG
+        id: meta
         run: |
-          docker tag keycloak:latest 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:latest
-          docker tag keycloak:latest 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:${TAG}
-          docker push 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:latest
-          docker push 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:${TAG}
+          echo "TAG=$(date -u +'%Y%m%d-%H%M')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      # 8. 触发 ECS Service 更新
-      - name: Update ECS service
+      - name: Tag and push to ECR
+        env:
+          REPO_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          TAG: ${{ steps.meta.outputs.TAG }}
+        run: |
+          set -euo pipefail
+          docker tag keycloak:latest "${REPO_URI}:latest"
+          docker tag keycloak:latest "${REPO_URI}:${TAG}"
+          docker push "${REPO_URI}:latest"
+          docker push "${REPO_URI}:${TAG}"
+
+      - name: Resolve image digest
+        id: digest
+        env:
+          TAG: ${{ steps.meta.outputs.TAG }}
+        run: |
+          set -euo pipefail
+          DIGEST=$(aws ecr batch-get-image \
+            --region "${AWS_REGION}" \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${TAG}" \
+            --query 'images[0].imageId.imageDigest' \
+            --output text)
+          if [ -z "${DIGEST}" ] || [ "${DIGEST}" = "None" ]; then
+            echo "Failed to get image digest for tag ${TAG}"
+            exit 1
+          fi
+          echo "DIGEST=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Resolved digest: ${DIGEST}"
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Register new task definition revision (replace image)
+        id: register
+        env:
+          CLUSTER: ${{ env.CLUSTER }}
+          SERVICE: ${{ env.SERVICE }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+          REPO_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          DIGEST: ${{ steps.digest.outputs.DIGEST }}
+        run: |
+          set -euo pipefail
+          TD_ARN=$(aws ecs describe-services \
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}" \
+            --query "services[0].taskDefinition" \
+            --output text)
+          echo "Current TD: ${TD_ARN}"
+
+          TD_JSON=$(aws ecs describe-task-definition \
+            --region "${AWS_REGION}" \
+            --task-definition "${TD_ARN}" \
+            --query 'taskDefinition |
+              {
+                family: family,
+                taskRoleArn: taskRoleArn,
+                executionRoleArn: executionRoleArn,
+                networkMode: networkMode,
+                containerDefinitions: containerDefinitions,
+                volumes: volumes,
+                placementConstraints: placementConstraints,
+                requiresCompatibilities: requiresCompatibilities,
+                cpu: cpu,
+                memory: memory,
+                pidMode: pidMode,
+                ipcMode: ipcMode,
+                proxyConfiguration: proxyConfiguration,
+                inferenceAccelerators: inferenceAccelerators,
+                ephemeralStorage: ephemeralStorage
+              }' \
+            --output json)
+
+          # 若 CONTAINER_NAME 未命中且只有 1 个容器，自动选择该容器
+          CONTAINER_COUNT=$(echo "${TD_JSON}" | jq '.containerDefinitions | length')
+          TARGET_CONTAINER="${CONTAINER_NAME}"
+          if [ "${CONTAINER_NAME}" = "" ] || [ "${CONTAINER_NAME}" = "keycloak" ]; then
+            if [ "${CONTAINER_COUNT}" -eq 1 ]; then
+              TARGET_CONTAINER=$(echo "${TD_JSON}" | jq -r '.containerDefinitions[0].name')
+              echo "Auto-detected single container: ${TARGET_CONTAINER}"
+            fi
+          fi
+
+          NEW_IMAGE="${REPO_URI}@${DIGEST}"  # 使用不可变 digest
+          NEW_TD_JSON=$(echo "${TD_JSON}" | jq --arg name "${TARGET_CONTAINER}" --arg img "${NEW_IMAGE}" '
+            .containerDefinitions = (.containerDefinitions | map(
+              if .name == $name then .image = $img else . end
+            ))')
+
+          REGISTER_OUT=$(aws ecs register-task-definition \
+            --region "${AWS_REGION}" \
+            --cli-input-json "${NEW_TD_JSON}")
+          NEW_TD_ARN=$(echo "${REGISTER_OUT}" | jq -r '.taskDefinition.taskDefinitionArn')
+          if [ -z "${NEW_TD_ARN}" ] || [ "${NEW_TD_ARN}" = "null" ]; then
+            echo "Failed to register new task definition"
+            echo "${REGISTER_OUT}"
+            exit 1
+          fi
+          echo "NEW_TD_ARN=${NEW_TD_ARN}" >> "$GITHUB_OUTPUT"
+          echo "Registered: ${NEW_TD_ARN}"
+
+      - name: Scale service to 0 (downtime replace)
         run: |
           set -euo pipefail
           aws ecs update-service \
-            --region ap-southeast-2 \
-            --cluster IDENTITY-CENTRE-NONPROD \
-            --service IDENTITY-CENTRE-NONPROD-SERVICE \
-            --force-new-deployment
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --service "${SERVICE}" \
+            --desired-count 0
+          aws ecs wait services-stable \
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}"
+          echo "Service scaled to 0."
 
-          # 调试：查看最近事件
+      - name: Update service to new task definition
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --service "${SERVICE}" \
+            --task-definition "${{ steps.register.outputs.NEW_TD_ARN }}" \
+            --deployment-configuration minimumHealthyPercent=0,maximumPercent=100
+          echo "Service updated to new TD."
+
+      - name: Scale service to 1
+        run: |
+          set -euo pipefail
+          aws ecs update-service \
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --service "${SERVICE}" \
+            --desired-count 1
+          aws ecs wait services-stable \
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}"
+          echo "Service scaled to 1 and stabilized."
+
+      - name: Show last 10 service events
+        if: always()
+        run: |
           aws ecs describe-services \
-            --region ap-southeast-2 \
-            --cluster IDENTITY-CENTRE-NONPROD \
-            --services IDENTITY-CENTRE-NONPROD-SERVICE \
+            --region "${AWS_REGION}" \
+            --cluster "${CLUSTER}" \
+            --services "${SERVICE}" \
             --query 'services[0].events[0:10]'
-
-            

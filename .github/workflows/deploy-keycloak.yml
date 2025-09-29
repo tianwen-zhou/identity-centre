@@ -1,0 +1,67 @@
+name: Deploy Keycloak to ECS (Terraform managed)
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-2
+  ACCOUNT_ID: "533267398655"
+  ECR_REPOSITORY: "appzgatenz/topsale/identity-centre"
+  TERRAFORM_DIR: "./terraform"
+  TF_VAR_cluster_name: "IDENTITY-CENTRE-NONPROD"
+  TF_VAR_service_name: "IDENTITY-CENTRE-NONPROD-SERVICE"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker image (Keycloak)
+        run: |
+          docker build -t keycloak:latest -f Dockerfile .
+
+      - name: Set image TAG
+        id: meta
+        run: |
+          echo "TAG=$(date -u +'%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
+
+      - name: Tag and push to ECR
+        env:
+          REPO_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          TAG: ${{ steps.meta.outputs.TAG }}
+        run: |
+          docker tag keycloak:latest "${REPO_URI}:latest"
+          docker tag keycloak:latest "${REPO_URI}:${TAG}"
+          docker push "${REPO_URI}:latest"
+          docker push "${REPO_URI}:${TAG}"
+
+      - name: Set Terraform image variable
+        run: |
+          echo "TF_VAR_image_uri=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_ENV
+
+      - name: Terraform Init
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: ${{ env.TERRAFORM_DIR }}
+        run: terraform apply -auto-approve

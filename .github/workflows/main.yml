@@ -3,7 +3,7 @@ name: Deploy Keycloak to ECS
 on:
   push:
     branches:
-      - main   # 只在 main 分支推送时触发
+      - main
 
 jobs:
   deploy:
@@ -32,17 +32,24 @@ jobs:
       - name: Build base image
         run: docker build -t identity-centre-base:latest -f Dockerfile_base .
 
-      # 5. 构建 keycloak 镜像（基于 base）
+      # 5. 构建 keycloak 镜像
       - name: Build keycloak image
         run: docker build -t keycloak:latest -f Dockerfile .
 
-      # 6. 推送到 ECR
+      # 6. 设置时间戳
+      - name: Set build timestamp
+        id: vars
+        run: echo "TAG=$(date +'%Y%m%d-%H%M')" >> $GITHUB_ENV
+
+      # 7. 推送到 ECR
       - name: Push Docker image to ECR
         run: |
           docker tag keycloak:latest 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:latest
+          docker tag keycloak:latest 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:${TAG}
           docker push 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:latest
+          docker push 533267398655.dkr.ecr.ap-southeast-2.amazonaws.com/appzgatenz/topsale/identity-centre:${TAG}
 
-      # 7. 触发 ECS Service 更新
+      # 8. 触发 ECS Service 更新
       - name: Update ECS service
         run: |
           aws ecs update-service \

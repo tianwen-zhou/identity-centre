@@ -8,7 +8,8 @@ on:
 env:
   AWS_REGION: ap-southeast-2
   ACCOUNT_ID: "533267398655"
-  ECR_REPOSITORY: "appzgatenz/topsale/identity-centre"
+  ECR_REPOSITORY_BASE: "appzgatenz/topsale/identity-centre-base"
+  ECR_REPOSITORY_APP: "appzgatenz/topsale/identity-centre"
   TERRAFORM_DIR: "./terraform"
   TF_VAR_cluster_name: "IDENTITY-CENTRE-NONPROD"
   TF_VAR_service_name: "IDENTITY-CENTRE-NONPROD-SERVICE"
@@ -32,21 +33,38 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to Amazon ECR
-        id: ecr
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Docker image (Keycloak)
+      # --------------------
+      # Build & Push Base Image
+      # --------------------
+      - name: Build base image
+        run: |
+          docker build -t identity-centre-base:latest -f Dockerfile_base .
+
+      - name: Tag & Push base image to ECR
+        env:
+          REPO_URI: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY_BASE }}
+        run: |
+          docker tag identity-centre-base:latest "${REPO_URI}:latest"
+          docker push "${REPO_URI}:latest"
+
+      # --------------------
+      # Build & Push Keycloak Image
+      # --------------------
+      - name: Build app image (Keycloak)
         run: |
           docker build -t keycloak:latest -f Dockerfile .
 
-      - name: Set image TAG
+      - name: Set TAG
         id: meta
         run: |
           echo "TAG=$(date -u +'%Y%m%d-%H%M')" >> "$GITHUB_OUTPUT"
 
-      - name: Tag and push to ECR
+      - name: Tag & Push Keycloak image to ECR
         env:
-          REPO_URI: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}
+          REPO_URI: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY_APP }}
           TAG: ${{ steps.meta.outputs.TAG }}
         run: |
           docker tag keycloak:latest "${REPO_URI}:latest"
@@ -54,9 +72,12 @@ jobs:
           docker push "${REPO_URI}:latest"
           docker push "${REPO_URI}:${TAG}"
 
+      # --------------------
+      # Terraform Deploy
+      # --------------------
       - name: Set Terraform image variable
         run: |
-          echo "TF_VAR_image_uri=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_ENV
+          echo "TF_VAR_image_uri=${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY_APP }}:${{ steps.meta.outputs.TAG }}" >> $GITHUB_ENV
 
       - name: Terraform Init
         working-directory: ${{ env.TERRAFORM_DIR }}
